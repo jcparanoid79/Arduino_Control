@@ -1,0 +1,275 @@
+from pyfirmata import Arduino, util, INPUT, OUTPUT, PWM # Import constants
+import time
+import sys # For exiting gracefully
+
+class ArduinoIO:
+    def __init__(self, port='COM4', output_pins=None, safe_state=0):
+        """
+        Initialize connection to Arduino UNO and set initial output pin states.
+
+        :param port: Serial port (e.g., 'COM4' on Windows, '/dev/ttyACM0' on Linux)
+        :param output_pins: A list of digital pin numbers intended for OUTPUT.
+                            These pins will be set to 'safe_state' immediately
+                            after connection. Example: [8, 9, 13]
+        :param safe_state: The initial state (0=LOW or 1=HIGH) to set the output_pins to.
+                           Choose the state that keeps your actuators OFF. Defaults to 1 (HIGH).
+        """
+        self.board = None
+        self.it = None
+        # Use a set for faster lookups if needed, list is fine here
+        self.output_pins_configured = output_pins if output_pins is not None else []
+        self.safe_state = safe_state
+        self._pin_modes = {} # Keep track of modes we've set
+
+        if safe_state not in [0, 1]:
+            print("Warning: safe_state must be 0 (LOW) or 1 (HIGH). Defaulting to 1 (HIGH).")
+            self.safe_state = 1
+
+        try:
+            print(f"Attempting to connect to Arduino on {port}...")
+            self.board = Arduino(port)
+            print(f"Successfully connected to Arduino on {port}.")
+
+            print("Starting communication iterator...")
+            self.it = util.Iterator(self.board)
+            self.it.start()
+
+            print("Allowing time for Firmata setup...")
+            self.board.pass_time(1.5)
+
+            print(f"Configuring initial safe state ({'HIGH' if self.safe_state else 'LOW'}) for output pins: {self.output_pins_configured}")
+            for pin_num in self.output_pins_configured:
+                try:
+                    # Use standard access, then set mode and write
+                    pin = self.board.digital[pin_num]
+                    pin.mode = OUTPUT
+                    pin.write(self.safe_state)
+                    self._pin_modes[pin_num] = OUTPUT # Track mode
+                    # Optional: Short pause between commands if many pins
+                    self.board.pass_time(0.05)
+                    print(f"  Pin {pin_num} set to safe state.")
+                except IndexError:
+                     print(f"  Warning: Invalid pin number {pin_num} for this board.")
+                except Exception as pin_e:
+                     # Handle potential errors like invalid pin number for the board
+                     print(f"  Warning: Could not configure pin {pin_num}. Error: {pin_e}")
+
+            print("Initial pin configuration complete.")
+            self.board.pass_time(0.5) # Final small delay
+
+        except Exception as e:
+            print(f"ERROR: Failed to connect or initialize Arduino: {e}")
+            print("Please ensure StandardFirmata is uploaded and the correct port is selected.")
+            self.board = None
+            # sys.exit(f"Exiting due to connection failure: {e}") # Uncomment to force exit
+
+    def _ensure_pin_mode(self, pin_num, mode):
+        """Internal helper to set pin mode if not already set or different."""
+        if not self.board: return None
+        try:
+            pin = self.board.digital[pin_num]
+            if self._pin_modes.get(pin_num) != mode:
+                pin.mode = mode
+                self._pin_modes[pin_num] = mode
+                self.board.pass_time(0.01) # Small delay after mode change
+            return pin
+        except IndexError:
+            print(f"Error: Invalid digital pin number {pin_num}.")
+            return None
+        except Exception as e:
+            print(f"Error accessing/setting mode for digital pin {pin_num}: {e}")
+            return None
+
+    def analog_read(self, pin):
+        """
+        Read analog value from specified pin (A0-A5)
+        :param pin: Analog pin number (0-5)
+        :return: Value between 0.0 and 1.0, or None on error/no connection
+        """
+        if not self.board:
+            print("Error: Not connected to Arduino.")
+            return None
+        try:
+            analog_pin = self.board.analog[pin]
+            analog_pin.enable_reporting() # Safe to call multiple times
+            self.board.pass_time(0.05)
+            value = analog_pin.read()
+            # Handle initial None value
+            retry_count = 0
+            while value is None and retry_count < 5:
+                 self.board.pass_time(0.05)
+                 value = analog_pin.read()
+                 retry_count += 1
+            if value is None:
+                 print(f"Warning: Could not get reading from analog pin {pin} after retries.")
+            return value
+        except IndexError:
+             print(f"Error: Invalid analog pin number A{pin}.")
+             return None
+        except Exception as e:
+             print(f"Error reading analog pin A{pin}: {e}")
+             return None
+
+    def analog_write(self, pin, value):
+        """
+        Write PWM value to digital pin (marked with ~).
+        :param pin: Digital pin number capable of PWM.
+        :param value: Value between 0.0 (off) and 1.0 (full duty cycle).
+        """
+        if not self.board:
+            print("Error: Not connected to Arduino.")
+            return
+        if not (0 <= value <= 1):
+            print(f"Error: PWM value must be between 0.0 and 1.0, got {value}")
+            return
+
+        pwm_pin = self._ensure_pin_mode(pin, PWM)
+        if pwm_pin:
+            try:
+                 pwm_pin.write(value)
+            except Exception as e:
+                  # Catch issues like pin not supporting PWM or other errors
+                 print(f"Error writing PWM to pin {pin}: {e}")
+
+    def digital_read(self, pin):
+        """
+        Read digital value from specified pin. Configures the pin as INPUT.
+        :param pin: Digital pin number.
+        :return: 0 (LOW) or 1 (HIGH), or None on error/no connection.
+        """
+        input_pin = self._ensure_pin_mode(pin, INPUT)
+        if input_pin:
+             try:
+                 # Allow iterator time to get the reading after mode potentially set
+                 self.board.pass_time(0.02)
+                 return input_pin.read()
+             except Exception as e:
+                 print(f"Error reading digital pin {pin}: {e}")
+                 return None
+        return None # Return None if pin couldn't be accessed
+
+
+    def digital_write(self, pin, value):
+        """
+        Write digital value to specified pin. Ensures the pin is in OUTPUT mode.
+        :param pin: Digital pin number.
+        :param value: 0 (LOW) or 1 (HIGH).
+        :return: The value written (0 or 1), or None on error.
+        """
+        if not self.board:
+            print("Error: Not connected to Arduino.")
+            return None
+        if value not in [0, 1]:
+            print(f"Error: Digital value must be 0 (LOW) or 1 (HIGH), got {value}")
+            return None
+
+        output_pin = self._ensure_pin_mode(pin, OUTPUT)
+        if output_pin:
+            try:
+                output_pin.write(value)
+                # Add to list if writing successfully (for close() method)
+                if pin not in self.output_pins_configured:
+                    self.output_pins_configured.append(pin)
+                return value
+            except Exception as e:
+                print(f"Error writing to digital pin {pin}: {e}")
+                return None
+        return None # Return None if pin couldn't be accessed
+
+    def close(self):
+        """
+        Set output pins to safe state and close the connection to Arduino.
+        """
+        print("Closing Arduino connection...")
+        if self.board:
+            print(f"Setting output pins {self.output_pins_configured} to safe state ({'HIGH' if self.safe_state else 'LOW'})...")
+            for pin_num in self.output_pins_configured:
+                try:
+                    # Use standard access here too
+                    pin_obj = self.board.digital[pin_num]
+                    # No need to ensure mode if we know it was output, but doesn't hurt
+                    pin_obj.mode = OUTPUT
+                    pin_obj.write(self.safe_state)
+                    self.board.pass_time(0.05) # Small delay
+                except IndexError:
+                    # Pin might not exist on this board, ignore.
+                    pass
+                except Exception as e:
+                    # Log other errors but continue trying to close
+                    print(f"  Warning: Could not set pin {pin_num} to safe state on close: {e}")
+
+            # --- FIX for AttributeError ---
+            # Remove the self.it.stop() call
+            # if self.it and self.it.is_alive():
+            #      # self.it.stop() # This line causes the error
+            #      print("Communication iterator stop signal sent (via board.exit).")
+
+            self.board.exit() # This handles stopping the iterator and closing the port
+            print("Arduino board connection closed.")
+        else:
+             print("No active Arduino connection to close.")
+        self.board = None # Ensure board is None after closing
+
+
+# Example usage (No changes needed here from your last version)
+if __name__ == "__main__":
+    # --- Configuration ---
+    ARDUINO_PORT = 'COM4' # CHANGE THIS to your Arduino's port
+    OUTPUT_PINS_TO_INITIALIZE = [13, 8] # Define pins you use for output
+    SAFE_OUTPUT_STATE = 0 # 0=LOW (if LOW activates actuators), 0=LOW (if HIGH activates)
+
+    # Initialize with specific output pins and safe state
+    arduino = ArduinoIO(
+        port=ARDUINO_PORT,
+        output_pins=OUTPUT_PINS_TO_INITIALIZE,
+        safe_state=SAFE_OUTPUT_STATE
+    )
+
+    # Check if connection was successful before proceeding
+    if arduino.board is None:
+        print("\nExiting script due to connection failure.")
+        sys.exit(1) # Exit with an error code
+
+    try:
+        print("\n--- Running Example ---")
+        time.sleep(1)
+
+        print("Reading Analog Pin A0...")
+        analog_value = arduino.analog_read(0)
+        if analog_value is not None:
+            print(f"Analog reading (A0): {analog_value:.3f}")
+        else:
+            print("Failed to read A0.")
+        time.sleep(0.5)
+
+        print("Reading Digital Pin 2 (ensure it's connected)...")
+        digital_value = arduino.digital_read(2)
+        if digital_value is not None:
+            print(f"Digital reading (Pin 2): {'HIGH' if digital_value == 1 else 'LOW'}")
+        else:
+            print("Failed to read Pin 2.")
+        time.sleep(0.5)
+
+        print("Setting PWM on Pin 9 to 50%...")
+        arduino.analog_write(9, 0.5)
+        time.sleep(2)
+        print("Setting PWM on Pin 9 to 0%...")
+        arduino.analog_write(9, 0.0)
+        time.sleep(0.5)
+
+        print(f"Turning Pin {OUTPUT_PINS_TO_INITIALIZE[0]} ON (Opposite of safe state)...")
+        on_state = 1 - SAFE_OUTPUT_STATE
+        arduino.digital_write(OUTPUT_PINS_TO_INITIALIZE[0], on_state)
+        time.sleep(3)
+
+        print(f"Turning Pin {OUTPUT_PINS_TO_INITIALIZE[0]} OFF (Back to safe state)...")
+        arduino.digital_write(OUTPUT_PINS_TO_INITIALIZE[0], SAFE_OUTPUT_STATE)
+        time.sleep(1)
+
+        print("\n--- Example Finished ---")
+
+    except KeyboardInterrupt:
+         print("\nKeyboard interrupt detected. Exiting.")
+    finally:
+        if 'arduino' in locals():
+            arduino.close()
